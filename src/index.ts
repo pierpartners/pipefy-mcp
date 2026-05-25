@@ -2870,7 +2870,7 @@ function copy(){
       return;
     }
 
-    // Descoberta OAuth 2.0 (RFC 8414) — usado pelo Claude.ai para encontrar os endpoints
+    // Descoberta OAuth 2.0 (RFC 8414) — metadados do Authorization Server
     if (path === "/.well-known/oauth-authorization-server") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -2880,7 +2880,20 @@ function copy(){
         response_types_supported: ["code"],
         grant_types_supported: ["authorization_code"],
         token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
+        code_challenge_methods_supported: ["S256"],
         scopes_supported: ["openid", "profile", "email"],
+      }));
+      return;
+    }
+
+    // Protected Resource Metadata (RFC 9728) — diz ao Claude.ai qual AS usar para /mcp
+    if (path === "/.well-known/oauth-protected-resource/mcp") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        resource: `${SERVER_BASE_URL}/mcp`,
+        authorization_servers: [SERVER_BASE_URL],
+        scopes_supported: ["openid", "profile", "email"],
+        resource_name: "Pipefy MCP Server",
       }));
       return;
     }
@@ -3029,7 +3042,7 @@ function copy(){
     if (!verifySession(sessionToken)) {
       res.writeHead(401, {
         "Content-Type": "application/json",
-        "WWW-Authenticate": `Bearer realm="${SERVER_BASE_URL}"`,
+        "WWW-Authenticate": `Bearer realm="${SERVER_BASE_URL}", resource_metadata="${SERVER_BASE_URL}/.well-known/oauth-protected-resource/mcp"`,
       });
       res.end(JSON.stringify({ error: "unauthorized" }));
       return;
