@@ -2108,13 +2108,17 @@ async function exportPipeAsDiagramDsl(pipe_id: string) {
   };
 }
 
-// ── MCP Server ─────────────────────────────────────────────────────────────────
-const server = new Server(
-  { name: "pipefy-mcp", version: "2.0.0" },
-  { capabilities: { tools: {} } }
-);
+// ── MCP Server factory ────────────────────────────────────────────────────────
+// Deve ser chamada uma vez por sessão (HTTP stateful) ou uma vez total (stdio).
+// O StreamableHTTPServerTransport não pode ser reutilizado entre requests, por
+// isso cada sessão precisa de um Server + Transport próprios.
+function buildMcpServer(): Server {
+  const srv = new Server(
+    { name: "pipefy-mcp", version: "2.0.0" },
+    { capabilities: { tools: {} } }
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  srv.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     // ── Group 1: Investigation ──
     {
@@ -2510,7 +2514,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  srv.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
@@ -2707,7 +2711,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
-});
+  });
+
+  return srv;
+}
+
+// Instância global usada apenas no modo stdio (Claude Code local)
+const server = buildMcpServer();
 
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : undefined;
@@ -2748,9 +2758,9 @@ if (PORT) {
   const pendingCodes = new Map<string, { clientRedirectUri: string; clientState: string | null; email: string; name: string; expiresAt: number }>();
   setInterval(() => { const now = Date.now(); for (const [k, v] of pendingCodes) if (v.expiresAt < now) pendingCodes.delete(k); }, 5 * 60 * 1000);
 
-  // Streamable HTTP transport (protocolo moderno, usado pelo Claude.ai web)
-  const mcpTransport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  await server.connect(mcpTransport);
+  // Mapa de sessões MCP ativas: mcp-session-id → transport
+  // Cada sessão tem seu próprio Server + Transport para evitar colisões de IDs.
+  const mcpSessions = new Map<string, StreamableHTTPServerTransport>();
 
   const PAGE_LANDING = `<!DOCTYPE html>
 <html lang="pt-BR">
@@ -3049,7 +3059,21 @@ function copy(){
     }
 
     if (path === "/mcp") {
-      await mcpTransport.handleRequest(req, res);
+      // Reutiliza sessão existente se o cliente enviar mcp-session-id
+      const incomingSession = req.headers["mcp-session-id"] as string | undefined;
+      if (incomingSession && mcpSessions.has(incomingSession)) {
+        await mcpSessions.get(incomingSession)!.handleRequest(req, res);
+      } else {
+        // Nova sessão: cria Server + Transport independentes
+        const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => crypto.randomUUID(),
+          onsessioninitialized: (id: string) => { mcpSessions.set(id, transport); },
+          onsessionclosed: (id: string) => { mcpSessions.delete(id); },
+        });
+        const freshServer = buildMcpServer();
+        await freshServer.connect(transport);
+        await transport.handleRequest(req, res);
+      }
     } else {
       res.writeHead(404);
       res.end();
