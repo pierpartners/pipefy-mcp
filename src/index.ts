@@ -2754,8 +2754,20 @@ if (PORT) {
     } catch { return null; }
   }
 
+  // Registro dinâmico de clientes OAuth (RFC 7591) — necessário para Claude.ai
+  interface OAuthClient {
+    client_id: string;
+    client_id_issued_at: number;
+    redirect_uris: string[];
+    grant_types: string[];
+    response_types: string[];
+    token_endpoint_auth_method: string;
+    client_name?: string;
+  }
+  const oauthClients = new Map<string, OAuthClient>();
+
   // Códigos OAuth temporários emitidos para o Claude.ai (expiram em 5 min)
-  const pendingCodes = new Map<string, { clientRedirectUri: string; clientState: string | null; email: string; name: string; expiresAt: number }>();
+  const pendingCodes = new Map<string, { clientId: string | null; clientRedirectUri: string; clientState: string | null; codeChallenge: string | null; email: string; name: string; expiresAt: number }>();
   setInterval(() => { const now = Date.now(); for (const [k, v] of pendingCodes) if (v.expiresAt < now) pendingCodes.delete(k); }, 5 * 60 * 1000);
 
   // Mapa de sessões MCP ativas: mcp-session-id → transport
@@ -2887,6 +2899,7 @@ function copy(){
         issuer: SERVER_BASE_URL,
         authorization_endpoint: `${SERVER_BASE_URL}/oauth/authorize`,
         token_endpoint: `${SERVER_BASE_URL}/oauth/token`,
+        registration_endpoint: `${SERVER_BASE_URL}/oauth/register`,
         response_types_supported: ["code"],
         grant_types_supported: ["authorization_code"],
         token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
@@ -2908,17 +2921,45 @@ function copy(){
       return;
     }
 
+    // Registro dinâmico de clientes OAuth (RFC 7591) — Claude.ai chama isso antes de iniciar o fluxo
+    if (path === "/oauth/register" && req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      let meta: { redirect_uris?: string[]; client_name?: string; grant_types?: string[]; response_types?: string[]; token_endpoint_auth_method?: string } = {};
+      try { meta = JSON.parse(body); } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_client_metadata", error_description: "Body must be valid JSON" }));
+        return;
+      }
+      const clientId = crypto.randomUUID();
+      const client: OAuthClient = {
+        client_id: clientId,
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        redirect_uris: meta.redirect_uris ?? [],
+        grant_types: meta.grant_types ?? ["authorization_code"],
+        response_types: meta.response_types ?? ["code"],
+        token_endpoint_auth_method: meta.token_endpoint_auth_method ?? "none",
+        ...(meta.client_name ? { client_name: meta.client_name } : {}),
+      };
+      oauthClients.set(clientId, client);
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(client));
+      return;
+    }
+
     // Endpoint de autorização OAuth — Claude.ai redireciona o usuário aqui
     if (path === "/oauth/authorize") {
       const clientRedirectUri = reqUrl.searchParams.get("redirect_uri");
       const clientState = reqUrl.searchParams.get("state");
+      const clientId = reqUrl.searchParams.get("client_id");
+      const codeChallenge = reqUrl.searchParams.get("code_challenge");
       if (!AZURE_CLIENT_ID || !AZURE_TENANT_ID) {
         res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
         res.end(pageError("Servidor não configurado. Defina AZURE_CLIENT_ID e AZURE_TENANT_ID."));
         return;
       }
-      // Codifica redirect_uri e state do Claude.ai no state que mandamos para a Microsoft
-      const msState = Buffer.from(JSON.stringify({ clientRedirectUri, clientState })).toString("base64url");
+      // Codifica dados do Claude.ai no state que mandamos para a Microsoft
+      const msState = Buffer.from(JSON.stringify({ clientRedirectUri, clientState, clientId, codeChallenge })).toString("base64url");
       const params = new URLSearchParams({
         client_id: AZURE_CLIENT_ID,
         response_type: "code",
@@ -3015,12 +3056,14 @@ function copy(){
         // Detecta se é fluxo OAuth do Claude.ai (tem state com clientRedirectUri)
         if (msState) {
           try {
-            const stateData = JSON.parse(Buffer.from(msState, "base64url").toString()) as { clientRedirectUri?: string; clientState?: string };
+            const stateData = JSON.parse(Buffer.from(msState, "base64url").toString()) as { clientRedirectUri?: string; clientState?: string; clientId?: string; codeChallenge?: string };
             if (stateData.clientRedirectUri) {
               const authCode = crypto.randomBytes(32).toString("hex");
               pendingCodes.set(authCode, {
+                clientId: stateData.clientId ?? null,
                 clientRedirectUri: stateData.clientRedirectUri,
                 clientState: stateData.clientState ?? null,
+                codeChallenge: stateData.codeChallenge ?? null,
                 email, name,
                 expiresAt: Date.now() + 5 * 60 * 1000,
               });
